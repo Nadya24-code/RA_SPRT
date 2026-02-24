@@ -1,0 +1,160 @@
+import pandas as pd
+import numpy as np
+import math
+
+def apply_ra(df, target_col, covariate_col):
+    
+    covariance = np.cov(df[target_col], df[covariate_col])[0, 1]
+    variance = np.var(df[covariate_col])
+    
+    theta = covariance / variance
+    
+    mean_cov = df[covariate_col].mean()
+    
+    new_col = f'{target_col}_ra'
+    df[new_col] = df[target_col] - theta * (df[covariate_col] - mean_cov)
+    
+    return df, theta
+
+def run_sprt_gaussian(df, target_col, mde, alpha=0.05, beta=0.2, sigma_sq=None):
+    
+    lower_bound = math.log(beta / (1 - alpha))
+    upper_bound = math.log((1 - beta) / alpha)
+    
+    daily = df.groupby(['dt_str', 'test_group'])[target_col].agg(['count', 'sum']).reset_index()
+    merged = pd.merge(
+        daily[daily.test_group == 0], 
+        daily[daily.test_group == 1], 
+        on='dt_str', suffixes=('_A', '_B')
+    )
+    merged = merged.sort_values('dt_str')
+    
+    cum_n_A = merged['count_A'].cumsum().values
+    cum_n_B = merged['count_B'].cumsum().values
+    cum_sum_A = merged['sum_A'].cumsum().values
+    cum_sum_B = merged['sum_B'].cumsum().values
+    
+    dates = merged['dt_str'].values
+    
+    if sigma_sq is None:
+        sigma_sq = df[target_col].var()
+        
+    stop_idx = None
+    inference = 'Continue'
+    final_llr = 0
+
+    for i in range(len(merged)):
+        nA, nB = cum_n_A[i], cum_n_B[i]
+        
+        mu_A = cum_sum_A[i] / nA
+        mu_B = cum_sum_B[i] / nB
+        
+        diff_obs = mu_B - mu_A
+        
+        var_diff = sigma_sq * (1/nA + 1/nB)
+        
+        if var_diff > 0:
+            llr = (diff_obs * mde / var_diff) - (0.5 * mde**2 / var_diff)
+        else:
+            llr = 0
+            
+        final_llr = llr
+        
+        if llr >= upper_bound:
+            inference = 'Accept H1 (Effect Found)'
+            stop_idx = i
+            break
+        elif llr <= lower_bound:
+            inference = 'Accept H0 (No Effect)'
+            stop_idx = i
+            break
+            
+    return {
+        'inference': inference,
+        'stop_day_index': stop_idx,
+        'stop_date': dates[stop_idx] if stop_idx is not None else None,
+        'final_llr': final_llr,
+        'total_days_processed': len(merged)
+    }
+
+#непрерывная метрика
+np.random.seed(42)
+days = 40
+metric_data = []
+
+true_mde = 2.0
+noise_std = 25.0
+
+for d in pd.date_range('2024-01-01', periods=days):
+    n = 1000
+    
+    cov = np.random.normal(100, 20, n)
+    #шум в данных
+    base_metric = 1.0 * cov + np.random.normal(0, 5, n)
+    
+    groups = np.array([0]*(n//2) + [1]*(n//2))
+    metric = base_metric + np.where(groups==1, true_mde, 0)
+    metric += np.random.normal(0, noise_std, n)
+    
+    metric_data.append(pd.DataFrame({
+        'dt_str': d, 'test_group': groups, 'metric': metric, 'covariate': cov
+    }))
+
+df_cont = pd.concat(metric_data).reset_index(drop=True)
+
+df_cont, _ = apply_ra(df_cont, 'metric', 'covariate')
+
+var_raw = df_cont['metric'].var()
+var_ra = df_cont['metric_ra'].var()
+
+res_raw = run_sprt_gaussian(df_cont, 'metric', mde=true_mde, sigma_sq=var_raw)
+res_ra = run_sprt_gaussian(df_cont, 'metric_ra', mde=true_mde, sigma_sq=var_ra)
+
+#бинарная метрика
+np.random.seed(42)
+days_bin = 60
+bin_data = []
+
+base_p = 0.30
+mde_bin = 0.015
+
+for d in pd.date_range('2024-01-01', periods=days_bin):
+    n = 800
+    
+    cov = np.random.normal(0, 1, n)
+    
+    logits = 1.5 * cov + np.random.normal(0, 1.0, n)
+    probs = 1 / (1 + np.exp(-logits))
+    probs = probs - probs.mean() + base_p
+    
+    groups = np.array([0]*(n//2) + [1]*(n//2))
+    probs_eff = probs + np.where(groups==1, mde_bin, 0)
+    
+    probs_eff = np.clip(probs_eff, 0, 1)
+    
+    conversions = np.random.binomial(1, probs_eff)
+    
+    bin_data.append(pd.DataFrame({
+        'dt_str': d, 'test_group': groups, 'metric': conversions, 'covariate': cov
+    }))
+
+df_bin = pd.concat(bin_data).reset_index(drop=True)
+
+df_bin, _ = apply_ra(df_bin, 'metric', 'covariate')
+
+var_bin_raw = df_bin['metric'].var()
+var_bin_ra = df_bin['metric_ra'].var()
+
+res_bin_raw = run_sprt_gaussian(df_bin, 'metric', mde=mde_bin, sigma_sq=var_bin_raw)
+
+res_bin_ra = run_sprt_gaussian(df_bin, 'metric_ra', mde=mde_bin, sigma_sq=var_bin_ra)
+
+print(f"[SPRT]   Результат: {res_raw['inference']}")
+print(f"Кол-во дней: {res_raw['stop_day_index']}")
+print(f"[RA+SPRT] Результат: {res_ra['inference']}")
+print(f"Кол-во дней: {res_ra['stop_day_index']}")
+
+print(f"[SPRT]   Результат: {res_bin_raw['inference']}")
+print(f"Кол-во дней: {res_bin_raw['stop_day_index']}")
+print(f"[RA+SPRT] Результат: {res_bin_ra['inference']}")
+print(f"Кол-во дней: {res_bin_ra['stop_day_index']}")
